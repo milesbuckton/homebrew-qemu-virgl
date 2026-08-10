@@ -1,0 +1,283 @@
+From 5d764220d3204b995133a3c34ad686747346e542 Mon Sep 17 00:00:00 2001
+From: Akihiko Odaki <akihiko.odaki@gmail.com>
+Date: Fri, 17 Dec 2021 14:51:32 +0900
+Subject: [PATCH] vrend: Relax the GLSL ES version requirement
+
+Commit a79e837b0d44199776612d2436c3c98a05287412 changed the GLES version
+requirement of the shaders to support blitting multi-sample textures,
+which is unavailable on GLES <3.1. However, the change was applied for
+all shaders, resulting in faults when blitting single-sample textures
+with GLES <3.1.
+
+Require GLES 3.1 only in the shaders for multi-sample textures, which
+are guarded with the feature detection.
+
+Signed-off-by: Akihiko Odaki <akihiko.odaki@gmail.com>
+---
+ src/vrend/vrend_blitter.h | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/src/vrend/vrend_blitter.h b/src/vrend/vrend_blitter.h
+index 91e24352..7a035712 100644
+--- a/src/vrend/vrend_blitter.h
++++ b/src/vrend/vrend_blitter.h
+@@ -35,6 +35,12 @@
+    "%s"                                         \
+ 
+ #define FS_HEADER_GLES                             \
++   "#version 300 es\n"                          \
++   "// Blitter\n"                               \
++   "%s"                                         \
++   "precision mediump float;\n"                 \
++
++#define FS_HEADER_GLES_MS                       \
+    "#version 310 es\n"                          \
+    "// Blitter\n"                               \
+    "%s"                                         \
+@@ -52,6 +58,11 @@
+    "// Blitter\n"                               \
+ 
+ #define HEADER_GLES                             \
++   "#version 300 es\n"                          \
++   "// Blitter\n"                               \
++   "precision mediump float;\n"                 \
++
++#define HEADER_GLES_MS                          \
+    "#version 310 es\n"                          \
+    "// Blitter\n"                               \
+    "precision mediump float;\n"                 \
+@@ -145,7 +156,7 @@
+    "}\n"
+ 
+ #define FS_TEXFETCH_COL_MSAA_GL FS_HEADER_GL FS_TEXFETCH_COL_MSAA_BODY
+-#define FS_TEXFETCH_COL_MSAA_GLES FS_HEADER_GLES FS_TEXFETCH_COL_MSAA_BODY
++#define FS_TEXFETCH_COL_MSAA_GLES FS_HEADER_GLES_MS FS_TEXFETCH_COL_MSAA_BODY
+ #define FS_TEXFETCH_COL_MSAA_ARRAY_GLES FS_HEADER_GLES_MS_ARRAY FS_TEXFETCH_COL_MSAA_BODY
+ 
+ #define FS_TEXFETCH_DS_BODY                             \
+@@ -178,7 +189,7 @@ struct vrend_context;
+ struct vrend_resource;
+ struct vrend_blit_info;
+ #define FS_TEXFETCH_DS_MSAA_GL HEADER_GL FS_TEXFETCH_DS_MSAA_BODY
+-#define FS_TEXFETCH_DS_MSAA_GLES HEADER_GLES FS_TEXFETCH_DS_MSAA_BODY_GLES
++#define FS_TEXFETCH_DS_MSAA_GLES HEADER_GLES_MS FS_TEXFETCH_DS_MSAA_BODY_GLES
+ #define FS_TEXFETCH_DS_MSAA_ARRAY_GLES HEADER_GLES_MS_ARRAY FS_TEXFETCH_DS_MSAA_BODY_GLES
+ 
+ /* implement blitting using OpenGL. */
+-- 
+2.39.5 (Apple Git-154)
+
+From bd9b30e58ef0cdfd05e300169bbdbd6983cabffd Mon Sep 17 00:00:00 2001
+From: Akihiko Odaki <akihiko.odaki@gmail.com>
+Date: Fri, 19 Feb 2021 13:43:42 +0900
+Subject: [PATCH] virglrenderer: Add vrend_renderer_borrow_texture_for_scanout
+
+virgl_renderer_resource_get_info is used to get texture information for
+scanout. However, it is also crucial to configure the texture correctly
+for scanout. Add vrend_renderer_borrow_texture_for_scanout, which
+"borrows" the texture and modifies its configuration.
+
+Signed-off-by: Akihiko Odaki <akihiko.odaki@gmail.com>
+---
+ src/virglrenderer.c  | 19 +++++++++++++++++++
+ src/virglrenderer.h  |  3 +++
+ src/vrend/vrend_renderer.c | 29 +++++++++++++++++++++++++++++
+ src/vrend/vrend_renderer.h |  2 ++
+ 4 files changed, 53 insertions(+)
+
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index f701da00..1e454c6e 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -551,6 +551,25 @@ int virgl_renderer_resource_get_info_ext(int res_handle,
+    return 0;
+ }
+ 
++int virgl_renderer_borrow_texture_for_scanout(int res_handle,
++                                              struct virgl_renderer_resource_info_ext *info)
++{
++   TRACE_FUNC();
++   struct virgl_resource *res = virgl_resource_lookup(res_handle);
++
++   if (!res)
++      return EINVAL;
++   if (!info)
++      return EINVAL;
++
++   if (!res->pipe_resource)
++      return 0;
++
++   vrend_renderer_borrow_texture_for_scanout(res->pipe_resource);
++
++   return virgl_renderer_resource_get_info_ext(res_handle, info);
++}
++
+ void virgl_renderer_get_cap_set(uint32_t cap_set, uint32_t *max_ver,
+                                 uint32_t *max_size)
+ {
+diff --git a/src/virglrenderer.h b/src/virglrenderer.h
+index 815c952d..bdb093be 100644
+--- a/src/virglrenderer.h
++++ b/src/virglrenderer.h
+@@ -364,6 +364,9 @@ VIRGL_EXPORT int virgl_renderer_resource_get_info(int res_handle,
+ VIRGL_EXPORT int virgl_renderer_resource_get_info_ext(int res_handle,
+                                                       struct virgl_renderer_resource_info_ext *info);
+ 
++VIRGL_EXPORT int virgl_renderer_borrow_texture_for_scanout(int res_handle,
++                                                           struct virgl_renderer_resource_info_ext *info);
++
+ VIRGL_EXPORT void virgl_renderer_cleanup(void *cookie);
+ 
+ /* reset the rendererer - destroy all contexts and resource */
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 4b8d1a68..13df42d5 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -13075,6 +13075,35 @@ void vrend_renderer_resource_get_info(struct pipe_resource *pres,
+    info->stride = util_format_get_nblocksx(res->base.format, u_minify(res->base.width0, 0)) * elsize;
+ }
+ 
++void vrend_renderer_borrow_texture_for_scanout(struct pipe_resource *pres)
++{
++   struct vrend_texture *tex = (struct vrend_texture *)pres;
++   struct vrend_format_table *tex_conv = &tex_conv_table[tex->base.base.format];
++
++   assert(tex->base.target == GL_TEXTURE_2D);
++   assert(!util_format_is_depth_or_stencil(tex->base.base.format));
++
++   glBindTexture(GL_TEXTURE_2D, tex->base.gl_id);
++
++   if (tex_conv->flags & VIRGL_TEXTURE_NEED_SWIZZLE) {
++      for (unsigned i = 0; i < ARRAY_SIZE(tex->cur_swizzle); ++i) {
++         GLint next_swizzle = to_gl_swizzle(tex_conv->swizzle[i]);
++         if (tex->cur_swizzle[i] != next_swizzle) {
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R + i, next_swizzle);
++            tex->cur_swizzle[i] = next_swizzle;
++         }
++      }
++   }
++
++   if (tex->cur_srgb_decode != GL_DECODE_EXT && util_format_is_srgb(tex->base.base.format)) {
++      if (has_feature(feat_texture_srgb_decode)) {
++         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SRGB_DECODE_EXT,
++                         GL_DECODE_EXT);
++         tex->cur_srgb_decode = GL_DECODE_EXT;
++      }
++   }
++}
++
+ int
+ vrend_renderer_resource_d3d11_texture2d(struct pipe_resource *pres, void **d3d_tex2d)
+ {
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index b242c8bb..fc0c6acf 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -563,6 +563,8 @@ struct vrend_blit_info {
+ void vrend_renderer_resource_get_info(struct pipe_resource *pres,
+                                       struct vrend_renderer_resource_info *info);
+ 
++void vrend_renderer_borrow_texture_for_scanout(struct pipe_resource *pres);
++
+ void vrend_renderer_get_cap_set(uint32_t cap_set, uint32_t *max_ver,
+                                 uint32_t *max_size);
+ 
+-- 
+2.39.5 (Apple Git-154)
+
+From eb922c477750ce7a79527a603981df9869de2507 Mon Sep 17 00:00:00 2001
+From: Akihiko Odaki <akihiko.odaki@gmail.com>
+Date: Sat, 7 Jan 2023 12:31:40 +0900
+Subject: [PATCH] vrend: Use integer vertex attribute on ANGLE on Apple
+
+This is necessary to render image_resize example of WebRender in
+changeset 722505:8b4648e13c46 on M2 MacBook Air.
+
+Signed-off-by: Akihiko Odaki <akihiko.odaki@gmail.com>
+---
+ src/vrend/vrend_renderer.c | 20 ++++++++++++++------
+ 1 file changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 13df42d5..68c51fb5 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -3473,7 +3473,8 @@ void vrend_bind_vertex_elements_state(struct vrend_context *ctx,
+       return;
+    }
+ 
+-   if (has_feature(feat_gles31_vertex_attrib_binding) && v->id == 0) {
++   if (has_feature(feat_gles31_vertex_attrib_binding)) {
++      if (v->id == 0) {
+       glGenVertexArrays(1, &v->id);
+       glBindVertexArray(v->id);
+       for (uint32_t i = 0; i < v->count; i++) {
+@@ -3491,6 +3492,17 @@ void vrend_bind_vertex_elements_state(struct vrend_context *ctx,
+          glVertexAttribBinding(i, ve->base.vertex_buffer_index);
+          glVertexBindingDivisor(i, ve->base.instance_divisor);
+          glEnableVertexAttribArray(i);
++         }
++      }
++   } else {
++      for (uint32_t i = 0; i < v->count; i++) {
++         struct vrend_vertex_element *ve = &v->elements[i];
++
++         if (util_format_is_pure_integer(ve->base.src_format)) {
++            UPDATE_INT_SIGN_MASK(ve->base.src_format, i,
++                                 v->signed_int_bitmask,
++                                 v->unsigned_int_bitmask);
++         }
+       }
+    }
+ }
+@@ -7586,11 +7598,7 @@ static bool use_integer(void) {
+       return true;
+ 
+    const char * a = (const char *) glGetString(GL_VENDOR);
+-   if (!a)
+-       return false;
+-   if (strcmp(a, "ARM") == 0)
+-      return true;
+-   return false;
++   return a && !(strcmp(a, "ARM") && strcmp(a, "Google Inc. (Apple)"));
+ }
+ 
+ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
+-- 
+2.39.5 (Apple Git-154)
+
+From 4a489584344787ea52226ac50dd9fa86a1f38f90 Mon Sep 17 00:00:00 2001
+From: Akihiko Odaki <akihiko.odaki@gmail.com>
+Date: Sun, 10 Dec 2023 20:31:06 +0900
+Subject: [PATCH] vrend: Reject VIRGL_CCMD_CLEAR_TEXTURE if unsupported
+
+Old versions of Mesa try to use VIRGL_CCMD_CLEAR_TEXTURE even if it is
+not supported:
+https://gitlab.freedesktop.org/mesa/mesa/-/issues/9944
+
+Check if VIRGL_CCMD_CLEAR_TEXTURE is supported when it is requested and
+return an error instead of crashing.
+
+Signed-off-by: Akihiko Odaki <akihiko.odaki@gmail.com>
+---
+ src/vrend/vrend_renderer.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 68c51fb5..0cbd2213 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -4910,6 +4910,10 @@ int vrend_clear_texture(struct vrend_context* ctx,
+    format = tex_conv_table[fmt].glformat;
+    type = tex_conv_table[fmt].gltype;
+ 
++   if (!has_feature(feat_clear_texture)) {
++      return EINVAL;
++   }
++
+    /* 32-bit BGRA resources are always reordered to RGBA ordering before
+     * submission to the host driver. Reorder red/blue color bytes in
+     * the clear color to match. */
+-- 
+2.39.5 (Apple Git-154)
+

@@ -1,0 +1,299 @@
+name: Upload qemu-virgl Homebrew tap
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Compute release tag
+        id: tag
+        run: |
+          # Fixed release tag => stable bottle root_url. `brew bottle
+          # --keep-old` aborts if root_url changes between builds, so the
+          # release/tag is pruned and recreated under the same name each run
+          # rather than minted per-run. See AGENTS.md.
+          TAG="latest"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: setup
+    strategy:
+      matrix:
+        include:
+          - os: macos-26
+            arch: arm64
+          - os: macos-26-intel
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+      HOMEBREW_NO_ANALYTICS: 1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up tap
+        run: |
+          # Tap the repository using file:// URL to use local checkout
+          brew tap milesbuckton/qemu-virgl file://${{ github.workspace }}
+          # Verify tap is set up correctly
+          brew tap-info milesbuckton/qemu-virgl
+
+      - name: Clear Homebrew cache
+        run: |
+          brew cleanup -s
+          rm -rf $(brew --cache)
+
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: brew-publish-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            brew-publish-${{ runner.os }}-
+
+      - name: Install gn for ANGLE build
+        run: |
+          # gn depends on python@3.13. The GitHub runners ship a preinstalled
+          # idle3.13 (intel: /usr/local/bin, arm: /opt/homebrew) that blocks the
+          # default brew link step, which would abort `brew install gn` and
+          # skip everything after it. Install + force-link python@3.13 FIRST,
+          # so gn's dependency install finds it already linked.
+          brew install python@3.13 || true
+          brew link --overwrite --force python@3.13
+          # ca-certificates is a transitive dependency of gn. Its post-install
+          # step can fail harmlessly on the Intel runner (cert bundle refresh),
+          # which would otherwise make `brew install gn` return non-zero. Install
+          # it first and run its post-install so it isn't re-triggered later.
+          brew install ca-certificates || true
+          brew postinstall ca-certificates || true
+          # Install gn from our tap. rapidjson is pulled in automatically as a
+          # build dependency of libangle, so installing it explicitly here is
+          # unnecessary (and was failing the step on the Intel runner).
+          brew install --build-bottle --formula milesbuckton/qemu-virgl/gn
+
+      - name: Build dependencies
+        run: |
+          brew install --build-bottle --formula milesbuckton/qemu-virgl/libangle --verbose
+          brew install --build-bottle --formula milesbuckton/qemu-virgl/libepoxy-angle --verbose
+          brew install --build-bottle --formula milesbuckton/qemu-virgl/virglrenderer --verbose
+
+      - name: Build qemu-virgl
+        run: |
+          # Install qemu-virgl. A genuine build failure must surface here.
+          # We deliberately do NOT `brew link` here: qemu-virgl intentionally
+          # shadows the standard `qemu`/`libepoxy` kegs, and forcing a link on
+          # the runner would fail (and isn't needed for bottling). The test and
+          # verify steps below invoke the binaries via their Cellar path.
+          # libepoxy-angle is keg_only, so it does not collide with the standard
+          # libepoxy pulled in transitively by qemu-virgl.
+          # gdk-pixbuf (a transitive dep) and ca-certificates can have post-install
+          # steps that fail benignly on CI; pre-install them so `brew install
+          # qemu-virgl` doesn't re-trigger (and fail on) their post-install.
+          brew install gdk-pixbuf ca-certificates || true
+          brew postinstall gdk-pixbuf ca-certificates || true
+          # A genuine compile/link failure surfaces in the Test step below (which
+          # runs the built binary). We tolerate the install's exit code here
+          # because several transitive deps (gdk-pixbuf, fontconfig, ca-certificates)
+          # have post-install steps that fail benignly on CI runners.
+          brew install --build-bottle --formula milesbuckton/qemu-virgl/qemu-virgl --verbose || true
+
+      - name: Test installation
+        run: |
+          QV=$(brew --prefix milesbuckton/qemu-virgl/qemu-virgl)/bin
+          "$QV/qemu-system-x86_64" --version
+          "$QV/qemu-img" --version
+
+      - name: Verify OpenGL/ANGLE library linking
+        run: |
+          set +e
+          QBIN=$(brew --prefix milesbuckton/qemu-virgl/qemu-virgl)/bin/qemu-system-aarch64
+          echo "=== Checking QEMU library dependencies ==="
+          otool -L "$QBIN" | grep -E "(libangle|libepoxy|virgl|spice-server)" || echo "⚠️  No OpenGL/SPICE libraries found in dependencies"
+
+          echo -e "\n=== Checking rpaths in QEMU binary ==="
+          otool -l "$QBIN" | grep -A2 LC_RPATH | grep path || echo "⚠️  No rpaths found"
+
+          echo -e "\n=== Verifying ANGLE libraries exist ==="
+          ls -lh $(brew --prefix)/opt/libangle/lib/libGLESv2.dylib || echo "⚠️  libGLESv2.dylib not found"
+          ls -lh $(brew --prefix)/opt/libangle/lib/libEGL.dylib || echo "⚠️  libEGL.dylib not found"
+
+          echo -e "\n=== Verifying libepoxy-angle exists ==="
+          ls -lh $(brew --prefix)/opt/libepoxy-angle/lib/libepoxy.0.dylib || echo "⚠️  libepoxy not found"
+
+          echo -e "\n=== Verifying virglrenderer exists ==="
+          ls -lh $(brew --prefix)/opt/virglrenderer/lib/libvirglrenderer.1.dylib || echo "⚠️  virglrenderer not found"
+
+          echo -e "\n=== Verifying spice-server exists ==="
+          ls -lh $(brew --prefix)/opt/spice-server/lib/libspice-server.1.dylib || echo "⚠️  spice-server not found"
+
+          echo -e "\n=== Checking QEMU build configuration ==="
+          "$QBIN" -display help 2>&1 | grep -E "(cocoa|sdl)" || echo "⚠️  Display backends not found"
+
+          echo -e "\n=== Checking QEMU device support ==="
+          "$QBIN" -device help 2>&1 | grep virtio-gpu || echo "⚠️  virtio-gpu devices not found"
+          set -e
+
+      - name: Compute release tag
+        id: tag
+        run: |
+          TAG="latest"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Create bottles
+        env:
+          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
+        run: |
+          mkdir -p bottles
+          # The bottle JSON's root_url must point at OUR GitHub release, not
+          # Homebrew's default domain (ghcr.io/homebrew/core). `brew bottle
+          # --merge` reads root_url from the JSON (the --root-url flag is ignored
+          # in merge mode), and bottle_output omits root_url when it equals the
+          # default domain — so without --root-url here the formula would end up
+          # with no root_url and `brew install` would 404 on ghcr.io.
+          ROOT_URL="https://github.com/${{ github.repository }}/releases/download/$RELEASE_TAG"
+          # --keep-old reuses each formula's hand-authored `rebuild N` verbatim
+          # instead of computing prev+1 from git history. The rebuild number is
+          # a macOS-generation marker (see AGENTS.md): it only moves when the
+          # formulae are edited deliberately, so reruns never inflate it.
+          brew bottle --json --keep-old --root-url "$ROOT_URL" milesbuckton/qemu-virgl/libangle
+          brew bottle --json --keep-old --root-url "$ROOT_URL" milesbuckton/qemu-virgl/libepoxy-angle
+          brew bottle --json --keep-old --root-url "$ROOT_URL" milesbuckton/qemu-virgl/virglrenderer
+          brew bottle --json --keep-old --root-url "$ROOT_URL" milesbuckton/qemu-virgl/qemu-virgl
+
+          # `brew bottle` names archives <formula>--<version>.<tag>.bottle.<rebuild>.tar.gz
+          # (double dash), but Homebrew resolves the download URL as
+          # <formula>-<version>.<tag>.bottle.<rebuild>.tar.gz (single dash). Rename the
+          # double dash to a single dash so `brew install` can find the archive on the
+          # release. Match *.bottle*.tar.gz (not *.bottle.tar.gz) because brew bottle
+          # appends a rebuild suffix when the formula has been rebuilt: e.g. *.bottle.5.tar.gz.
+          for file in *.bottle*.tar.gz; do
+            if [ -f "$file" ]; then
+              newname=$(echo "$file" | sed 's/--/-/')
+              if [ "$file" != "$newname" ]; then
+                echo "Renaming: $file -> $newname"
+                mv "$file" "$newname"
+              fi
+            fi
+          done
+
+          mv *.bottle*.tar.gz *.bottle.json bottles/ 2>/dev/null || true
+
+      - name: Upload bottles as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bottles-${{ matrix.os }}
+          path: bottles/
+
+  release:
+    needs: [publish, setup]
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all bottle artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-bottles
+          pattern: bottles-*
+          merge-multiple: true
+
+      - name: Create release and upload bottles
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
+        run: |
+          BUILD_STAMP="$(date -u +%Y%m%d.%H%M%S)"
+
+          # Keep at most one release: delete any previous release and its tag
+          # so re-runs never accumulate.
+          OLD_TAG=$(gh release list --repo ${{ github.repository }} --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || true)
+          if [ -n "$OLD_TAG" ]; then
+            echo "Pruning previous release/tag: $OLD_TAG"
+            gh release delete "$OLD_TAG" --repo ${{ github.repository }} --yes --cleanup-tag || true
+          fi
+
+          # Create release
+          gh release create "$RELEASE_TAG" \
+            --repo ${{ github.repository }} \
+            --title "Bottles $BUILD_STAMP" \
+            --notes "Pre-built bottles for macOS Tahoe (Apple Silicon + Intel), built $BUILD_STAMP" \
+            all-bottles/*.bottle*.tar.gz
+
+      - name: Set up tap
+        run: |
+          brew tap milesbuckton/qemu-virgl file://${{ github.workspace }}
+          brew trust milesbuckton/qemu-virgl
+
+      - name: Merge bottle blocks into formulae
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
+        run: |
+          cd ${{ github.workspace }}
+          for formula in libangle libepoxy-angle virglrenderer qemu-virgl; do
+            # Collect every bottle JSON produced for this formula across all
+            # arches, then merge them ALL in a single `brew bottle --merge` call.
+            # `brew bottle --merge` REPLACES the formula's bottle block with the
+            # tags from the JSON(s) given in that invocation; it does not read the
+            # block written by a previous call. Merging one JSON per call would
+            # therefore drop every arch but the last one processed, so both the
+            # arm64_tahoe and tahoe bottles must be passed together.
+            jsons=()
+            for json in all-bottles/*${formula}*.bottle.json; do
+              [ -f "$json" ] || continue
+              jsons+=("$json")
+            done
+            if [ ${#jsons[@]} -gt 0 ]; then
+              echo "Merging ${jsons[*]} for $formula"
+              brew bottle --merge --write --root-url "https://github.com/${{ github.repository }}/releases/download/$RELEASE_TAG" "${jsons[@]}"
+            fi
+          done
+          # brew bottle --merge --write updates the tap clone under
+          # $(brew --repository)/Library/Taps, so copy the merged formulae back
+          # into the workspace before committing.
+          cp $(brew --repository)/Library/Taps/milesbuckton/homebrew-qemu-virgl/Formula/*.rb Formula/
+
+      - name: Commit merged bottle blocks
+        run: |
+          cd ${{ github.workspace }}
+          git config user.name "Miles Buckton"
+          git config user.email "miles.buckton@gmail.com"
+          git add Formula/
+          if git diff --cached --quiet; then
+            echo "No formula changes to commit"
+          else
+            git commit -m "Update bottle blocks from release $RELEASE_TAG"
+            # main may have moved (e.g. a force-push squash) while the build ran.
+            # Rebase our bottle commit onto the latest main before pushing so the
+            # push is a fast-forward rather than being rejected.
+            git fetch origin main
+            git rebase origin/main || git rebase --abort
+            git push origin main
+          fi
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brew-logs-publish
+          path: |
+            ~/Library/Logs/Homebrew/*.log
+            ~/Library/Logs/Homebrew/*/*.log
+            ~/Library/Caches/Homebrew/Logs/*.log
