@@ -1,0 +1,32 @@
+name: "Homebrew style"
+
+# Lint the formulae with Homebrew's own rubocop cop set (`brew style`), which
+# understands the Formula DSL. The repository contains no Ruby outside
+# Formula/, so a plain-rubocop job (the previous setup) inspected zero files
+# and always passed.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: '22 7 * * 2'
+
+jobs:
+  style:
+    runs-on: macos-26
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v7
+
+    - name: Set up tap
+      run: |
+        brew tap milesbuckton/qemu-virgl file://${{ github.workspace }}
+        brew trust milesbuckton/qemu-virgl
+        brew tap-info milesbuckton/qemu-virgl
+
+    - name: Run brew style
+      run: brew style milesbuckton/qemu-virgl
