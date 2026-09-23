@@ -16,10 +16,12 @@ permissions:
   contents: write
 
 # All three macOS jobs in the publish chain (publish, release, verify)
-# run on the same `macos-NN` image. When bumping to a new macOS generation,
-# update this one commit (see AGENTS.md):
+# run on the same runner image. GitHub no longer ships `macos-NN` labels
+# past `macos-26` — macOS images are Xcode-versioned now, and `xcode-27`
+# runs on macOS 27. When bumping to a new macOS generation, update this
+# one commit (see AGENTS.md):
 #
-#   sed -i '' 's/macos-26/macos-27/g' .github/workflows/publish.yml
+#   sed -i '' 's/macos-26/xcode-27/g' .github/workflows/publish.yml
 #
 # `env:` cannot be referenced inside `runs-on:` (the expression context is
 # limited there), so the value is inlined in each job and the `sed` keeps
@@ -44,13 +46,13 @@ jobs:
 
   publish:
     needs: setup
-    runs-on: macos-26
+    runs-on: xcode-27
     env:
       HOMEBREW_NO_AUTO_UPDATE: 1
       HOMEBREW_NO_INSTALL_CLEANUP: 1
       HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
       HOMEBREW_NO_ANALYTICS: 1
-      # Build everything from source so the macOS 26 runner never
+      # Build everything from source so the macOS 27 runner never
       # aborts on "no bottle available!" for dependencies (e.g. openssl@3,
       # orc, pygobject3).
       HOMEBREW_BUILD_FROM_SOURCE: 1
@@ -98,7 +100,7 @@ jobs:
           brew postinstall ca-certificates || true
           # gn's dependency tree (via python@3.14) pulls openssl@3. The runner
           # ships an outdated openssl@3, and gn's --build-from-source install
-          # tries to upgrade it to the latest, which is broken on the macOS 26
+          # tries to upgrade it to the latest, which is broken on the macOS 27
           # arm64 runner: the API-source formula read errors with
           # "unknown keyword: :overwrite". Pinning fails too ("requires the
           # latest version of pinned dependencies").
@@ -222,7 +224,7 @@ jobs:
 
   release:
     needs: [publish, setup]
-    runs-on: macos-26
+    runs-on: xcode-27
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -276,7 +278,7 @@ jobs:
           gh release create "$RELEASE_TAG" \
             --repo ${{ github.repository }} \
             --title "Bottles $BUILD_STAMP" \
-            --notes "Pre-built bottles for macOS 26 (Apple Silicon), built $BUILD_STAMP" \
+            --notes "Pre-built bottles for macOS 27 (Apple Silicon), built $BUILD_STAMP" \
             all-bottles/*.bottle*.tar.gz
 
       - name: Set up tap
@@ -347,7 +349,7 @@ jobs:
     # release is overwritten on every publish, so an out-of-order verify job
     # could otherwise test stale bottles from a previous run).
     needs: release
-    runs-on: macos-26
+    runs-on: xcode-27
     env:
       HOMEBREW_NO_AUTO_UPDATE: 1
       HOMEBREW_NO_INSTALL_CLEANUP: 1

@@ -9,8 +9,8 @@ class LibepoxyAngle < Formula
 
   bottle do
     root_url "https://github.com/milesbuckton/homebrew-qemu-virgl/releases/download/latest"
-    rebuild 1
-    sha256 cellar: :any, arm64_tahoe: "186813b5140575b38ff5ef3adfb2fae82dd5fa336c6e346b5099057208d525a0"
+    rebuild 2
+    sha256 cellar: :any, arm64_golden_gate: "0067b21daee5f683b58e357c007d939f5f79f05e6e7cc922cb065632b0f0c42b"
   end
 
   keg_only :provided_by_macos_or_another_formula

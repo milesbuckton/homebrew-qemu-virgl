@@ -18,8 +18,8 @@ class Libangle < Formula
 
   bottle do
     root_url "https://github.com/milesbuckton/homebrew-qemu-virgl/releases/download/latest"
-    rebuild 1
-    sha256 cellar: :any, arm64_tahoe: "6c3732dc8c72d7d150cadfe623f98f20ed4f4f09c0ec79642a4eee0e34370955"
+    rebuild 2
+    sha256 cellar: :any, arm64_golden_gate: "583c70e8a8f5a7492aa7a31aac3a3553647b20335e9249d408629b0a490bd02f"
   end
 
   depends_on "milesbuckton/qemu-virgl/gn" => :build

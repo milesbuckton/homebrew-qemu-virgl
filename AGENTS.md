@@ -26,12 +26,14 @@ build-only tool dependency of libangle) and is excluded from this convention.
 
 **Also bump the workflow runner in the same commit.** All three
 publish-chain jobs in `.github/workflows/publish.yml` (`publish`,
-`release`, `verify`) declare `runs-on: macos-NN`. When bumping, update
+`release`, `verify`) declare the same `runs-on` image. GitHub no longer
+ships `macos-NN` labels past `macos-26` — macOS images are Xcode-versioned
+now, and `xcode-27` runs on macOS 27. When bumping, update
 all three sites at once — the workflow file has a `sed` recipe in a
 top-of-file comment you can paste, e.g.:
 
 ```sh
-sed -i '' 's/macos-26/macos-27/g' .github/workflows/publish.yml
+sed -i '' 's/macos-26/xcode-27/g' .github/workflows/publish.yml
 ```
 
 `env:` cannot be referenced inside `runs-on:` (the expression context
@@ -45,7 +47,7 @@ Do not change `rebuild` or the runner at any other time.
 
 **Also update the macOS codename** in bottle tags and comments wherever it
 appears. Homebrew bottle tags use the format `arm64_<codename>` (e.g.
-`arm64_golden_gate` for macOS 26). When bumping
+`arm64_golden_gate` for macOS 27). When bumping
 the macOS version, update the codename in all of these locations:
 
 - `Formula/qemu-virgl.rb`, `Formula/virglrenderer.rb`,

@@ -11,8 +11,8 @@ class Virglrenderer < Formula
 
   bottle do
     root_url "https://github.com/milesbuckton/homebrew-qemu-virgl/releases/download/latest"
-    rebuild 1
-    sha256 arm64_tahoe: "f8ba3f631dbb36a227efea0671cdda0d8b8fe19c4f227bf4fef4e75b6851c8e6"
+    rebuild 2
+    sha256 arm64_golden_gate: "058cb9c5a513f57051a6bd1c5842367d352815ac74617b799a5c5b5df296e790"
   end
 
   depends_on "cmake" => :build

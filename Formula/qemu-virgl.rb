@@ -8,8 +8,8 @@ class QemuVirgl < Formula
 
   bottle do
     root_url "https://github.com/milesbuckton/homebrew-qemu-virgl/releases/download/latest"
-    rebuild 1
-    sha256 arm64_tahoe: "74f8acee22605bf1653803fdcadb7b9e354ef5cb7402c372caec6084b62d5e42"
+    rebuild 2
+    sha256 arm64_golden_gate: "016192328ed5aee047d2336ce8eca30c17ddb3f7815652c78c75f8d4803b1d53"
   end
 
   depends_on "libtool" => :build
@@ -104,6 +104,10 @@ class QemuVirgl < Formula
       --extra-ldflags=-Wl,-rpath,#{epoxy_prefix}/lib
       --extra-ldflags=-Wl,-rpath,#{virgl_prefix}/lib
     ]
+
+    # ParavirtualizedGraphics (apple-gfx) APIs used by QEMU were obsoleted
+    # in the macOS 27 SDK; same guard as Homebrew's core qemu formula.
+    args << "--disable-pvg" if OS.mac? && MacOS.version >= :golden_gate
 
     # smbd for -net user,smb=. Only wired up when a samba build providing it
     # is actually installed (e.g. via a third-party tap); otherwise the flag
