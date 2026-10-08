@@ -1,0 +1,95 @@
+name: "Homebrew style"
+
+# Lint the formulae with Homebrew's own rubocop cop set (`brew style`), which
+# understands the Formula DSL. The repository contains no Ruby outside
+# Formula/, so a plain-rubocop job (the previous setup) inspected zero files
+# and always passed.
+#
+# Note that publish.yml amends main and force-pushes it using the default
+# GITHUB_TOKEN, and GitHub deliberately does not fire `push` triggers for
+# GITHUB_TOKEN pushes (anti-recursion) -- so the bottle-block commit (the
+# tip of main) is never styled automatically after a publish run.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: '22 7 * * 2'
+
+jobs:
+  style:
+    runs-on: xcode-27
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v7
+
+    - name: Set up tap
+      run: |
+        brew tap milesbuckton/qemu-virgl file://${{ github.workspace }}
+        brew trust milesbuckton/qemu-virgl
+        brew tap-info milesbuckton/qemu-virgl
+
+    - name: Run brew style
+      run: brew style milesbuckton/qemu-virgl
+
+    # `brew style` only lints; it does not run the audit rules, so offences like
+    # a redundant `using:` on a `.git` resource URL pass CI unnoticed. This is
+    # where the formula-level conventions get enforced.
+    #
+    # Iterate over the tap's formulae rather than naming the tap: `brew style`
+    # accepts a tap name, but `brew audit` only takes formula names and errors
+    # with "No available formula with the name ..." if given one. Enumerating
+    # the directory also means a newly added formula is covered automatically.
+    - name: Run brew audit
+      run: |
+        tap_dir="$(brew --repository milesbuckton/qemu-virgl)"
+        rc=0
+        for formula in "$tap_dir"/Formula/*.rb; do
+          name="$(basename "$formula" .rb)"
+          echo "=== auditing milesbuckton/qemu-virgl/${name} ==="
+          # Keep going after a failure so one bad formula does not hide the rest.
+          brew audit --strict "milesbuckton/qemu-virgl/${name}" || rc=1
+        done
+        exit "$rc"
+
+    - name: Check shared Python resources stay in lockstep
+      # setuptools, wheel and packaging are declared identically in
+      # qemu-virgl.rb and virglrenderer.rb (both formulae feed the same
+      # HermeticVenv build backend). The two "update both in lockstep" NOTE
+      # comments document the coupling but cannot enforce it, and a silent
+      # drift only surfaces ~30 minutes into a publish as a pip checksum
+      # mismatch. Assert each shared resource block is byte-identical across
+      # both formulae -- the same "turn a silent no-op into a loud failure"
+      # principle as the `patch!` helper and verify-gpu-wiring.sh.
+      shell: bash
+      run: |
+        set -euo pipefail
+        tap_dir="$(brew --repository milesbuckton/qemu-virgl)"
+        qv="$tap_dir/Formula/qemu-virgl.rb"
+        vr="$tap_dir/Formula/virglrenderer.rb"
+
+        # Print the `resource "<name>" do ... end` block from a formula.
+        extract() {
+          awk -v name="$1" '$0 ~ ("resource \"" name "\" do"){f=1} f{print} f && /^  end/{exit}' "$2"
+        }
+
+        rc=0
+        for res in setuptools wheel packaging; do
+          qv_block="$(extract "$res" "$qv")"
+          vr_block="$(extract "$res" "$vr")"
+          if [ -z "$qv_block" ] || [ -z "$vr_block" ]; then
+            echo "::error::resource \"${res}\" must be declared in BOTH qemu-virgl.rb and virglrenderer.rb"
+            rc=1
+          elif [ "$qv_block" != "$vr_block" ]; then
+            echo "::error::resource \"${res}\" differs between qemu-virgl.rb and virglrenderer.rb; update both in lockstep"
+            diff -u <(printf '%s\n' "$qv_block") <(printf '%s\n' "$vr_block") || true
+            rc=1
+          else
+            echo "ok: ${res} in lockstep"
+          fi
+        done
+        exit "$rc"

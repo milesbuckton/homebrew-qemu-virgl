@@ -1,0 +1,526 @@
+name: Upload qemu-virgl Homebrew tap
+
+on:
+  workflow_dispatch:
+
+# Serialize the publish and verify jobs against any concurrent reruns of
+# this workflow. cancel-in-progress: false so a re-run waits for the
+# previous publish to finish — never cancel a half-completed publish
+# (the bottle-block commit may have already been pushed but not yet
+# folded, and cancelling then would leave main in a non-one-commit state).
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+# Read-only by default; the `release` job is the only one that writes (release
+# assets plus the amended bottle-block commit) and declares its own
+# `contents: write`. `publish` only builds and uploads workflow artifacts.
+permissions:
+  contents: read
+
+# Fixed release tag => stable bottle root_url. The release is pruned and
+# recreated under the same name each run rather than minted per-run, so bottle
+# URLs never change. See AGENTS.md.
+env:
+  RELEASE_TAG: latest
+
+# All three macOS jobs in the publish chain (publish, release, verify)
+# run on the same runner image. GitHub no longer ships `macos-NN` labels —
+# macOS images are Xcode-versioned now, and `xcode-27` runs on macOS 27.
+# When bumping to a new macOS generation, update this in one commit (see
+# AGENTS.md):
+#
+#   sed -i '' 's/xcode-27/xcode-28/g' .github/workflows/publish.yml
+#
+# `env:` cannot be referenced inside `runs-on:` (the expression context is
+# limited there), so the value is inlined in each job and the `sed` keeps
+# the three sites in sync. Don't edit the runner labels by hand — always
+# use the sed so a partial migration can't leave one job on the old image.
+
+jobs:
+  publish:
+    runs-on: xcode-27
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+      HOMEBREW_NO_ANALYTICS: 1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up tap
+        run: |
+          # Tap the repository using file:// URL to use local checkout
+          brew tap milesbuckton/qemu-virgl file://${{ github.workspace }}
+          brew trust milesbuckton/qemu-virgl
+          # Verify tap is set up correctly
+          brew tap-info milesbuckton/qemu-virgl
+          # Strip any `rebuild N` from the tapped formulae BEFORE building:
+          # `brew bottle` stamps `.N` onto the archive name (and
+          # `brew bottle --merge` writes it back into the bottle block), so a
+          # stray rebuild line makes bottles ship as
+          # <formula>-<version>.<tag>.bottle.N.tar.gz while the formula would
+          # point at the un-numbered name. The release job strips it again
+          # after the merge; doing it here too keeps the archive name and the
+          # bottle block in agreement.
+          #
+          # NOTE: this sed only rewrites the tap's WORKING TREE, and current
+          # Homebrew does not derive the rebuild from there anyway — it reads
+          # the formula at the tap's origin/HEAD (the committed state) and,
+          # for an unchanged pkg_version, uses upstream rebuild + 1. That is
+          # why `.bottle.1` appeared even though no formula declares a
+          # rebuild: the real guard is `--no-rebuild` in "Create bottles".
+          # This sed stays as a belt-and-braces check. See AGENTS.md.
+          sed -i '' -e '/^[[:space:]]*rebuild[[:space:]]*[0-9]/d' \
+            "$(brew --repository milesbuckton/qemu-virgl)"/Formula/*.rb
+
+      - name: Clear Homebrew cache
+        # Remove any cached repo state so every build clones fresh source
+        # checkouts and never inherits a corrupted git object from a prior run.
+        run: |
+          brew cleanup -s || true
+          rm -rf "$(brew --cache)"
+          rm -rf ~/Library/Caches/Homebrew/*-git
+
+      - name: Install gn for ANGLE build
+        run: |
+          # gn depends on python@3.14. The GitHub runners ship a preinstalled
+          # idle3.14 at /opt/homebrew that blocks the default brew link step,
+          # which would abort `brew install gn` and skip everything after it.
+          # Install + force-link python@3.14 FIRST, so gn's dependency install
+          # finds it already linked.
+          brew install python@3.14 || true
+          brew link --overwrite --force python@3.14
+          # ca-certificates is a transitive dependency of gn. Its post-install
+          # step can fail harmlessly on CI (cert bundle refresh), which would
+          # otherwise make `brew install gn` return non-zero. Install it first
+          # and run its post-install so it isn't re-triggered later.
+          brew install ca-certificates || true
+          brew postinstall ca-certificates || true
+          # gn's dependency tree (via python@3.14) pulls openssl@3. The runner
+          # ships an outdated openssl@3, and gn's --build-from-source install
+          # tries to upgrade it to the latest, which is broken on the macOS 27
+          # arm64 runner: the API-source formula read errors with
+          # "unknown keyword: :overwrite". Pinning fails too ("requires the
+          # latest version of pinned dependencies").
+          #
+          # Strategy: get openssl@3 to its latest buildable/pourable state
+          # BEFORE gn runs, so gn's resolution finds it satisfied and does not
+          # attempt an upgrade mid-install. Try the bottle upgrade first; if
+          # that fails, fall back to a source build of openssl@3. Doing this
+          # here, before gn, means gn never triggers the broken upgrade path
+          # itself.
+          brew upgrade openssl@3 || brew install --build-from-source openssl@3 || true
+          # Install gn from our tap. The pre-work above is best-effort, but a
+          # genuine gn install failure must fail the job here — otherwise the
+          # failure resurfaces two steps later as an opaque "gn: command not
+          # found" inside the libangle build.
+          brew install --build-from-source --formula milesbuckton/qemu-virgl/gn
+
+      - name: Build dependencies
+        run: |
+          brew install --build-bottle --formula milesbuckton/qemu-virgl/libangle --verbose
+          brew install --build-bottle --formula milesbuckton/qemu-virgl/libepoxy-angle --verbose
+          brew install --build-bottle --formula milesbuckton/qemu-virgl/virglrenderer --verbose
+
+      - name: Build qemu-virgl
+        run: |
+          # Install qemu-virgl. A genuine build failure must surface here.
+          # We deliberately do NOT `brew link` here: qemu-virgl intentionally
+          # shadows the standard `qemu`/`libepoxy` kegs, and forcing a link on
+          # the runner would fail (and isn't needed for bottling). The test and
+          # verify steps below invoke the binaries via their Cellar path.
+          # libepoxy-angle is keg_only, so it does not collide with the standard
+          # libepoxy pulled in transitively by qemu-virgl.
+          # gdk-pixbuf and ca-certificates (transitive deps pulled in by gnutls/
+          # glib, etc.) can have post-install steps that fail benignly on CI
+          # runners (cert refresh, font cache rebuild); pre-install them and
+          # run their post-install so the qemu-virgl install below doesn't
+          # re-trigger (and fail on) their post-install. The qemu-virgl install
+          # itself is allowed to exit non-zero: a genuine compile/link failure
+          # surfaces in the Test step below (which runs the built binary).
+          brew install gdk-pixbuf ca-certificates || true
+          brew postinstall gdk-pixbuf ca-certificates || true
+          # Do not mask a failed install. The build step above already ate its
+          # own output on success, so a broken build used to look like an empty
+          # keg and only surface minutes later as "qemu-system-aarch64: No such
+          # file or directory" in the Test step — with no record of why.
+          if ! brew install --build-bottle --formula milesbuckton/qemu-virgl/qemu-virgl --verbose; then
+            echo "::error::qemu-virgl install failed — a broken build is being bottled as stale"
+            exit 1
+          fi
+
+      - name: Test installation
+        run: |
+          QV=$(brew --prefix milesbuckton/qemu-virgl/qemu-virgl)/bin
+          "$QV/qemu-system-aarch64" --version
+          "$QV/qemu-img" --version
+
+      # Hard assertions. The previous inline version printed a warning after
+      # every probe under `set +e`, so it could not fail the job — and its
+      # central probe grepped the QEMU binary for "libangle", which never
+      # matches, because libepoxy dlopens EGL rather than linking it.
+      - name: Verify GPU wiring
+        run: ./script/verify-gpu-wiring.sh
+
+      - name: Create bottles
+        run: |
+          mkdir -p bottles
+          # The bottle JSON's root_url must point at OUR GitHub release, not
+          # Homebrew's default domain (ghcr.io/homebrew/core). `brew bottle
+          # --merge` reads root_url from the JSON (the --root-url flag is ignored
+          # in merge mode), and bottle_output omits root_url when it equals the
+          # default domain — so without --root-url here the formula would end up
+          # with no root_url and `brew install` would 404 on ghcr.io.
+          ROOT_URL="https://github.com/${{ github.repository }}/releases/download/$RELEASE_TAG"
+          # `--no-rebuild` is REQUIRED, not cosmetic. Omitting a `rebuild`
+          # line from the formula is no longer enough: `brew bottle` derives
+          # the rebuild itself when the formula's pkg_version matches the one
+          # at the tap's origin/HEAD (upstream bottle rebuild + 1), which for
+          # these never-reversioned formulae means every run bottles as
+          # `<formula>--<version>.<tag>.bottle.1.tar.gz` with `"rebuild": 1`
+          # in the JSON. The release job then strips the `rebuild 1` line
+          # that `brew bottle --merge` writes back, so the committed formula
+          # requests the un-numbered URL while the uploaded asset is numbered
+          # — a 404 in `verify`. `--no-rebuild` forces rebuild 0, keeping the
+          # archive name plain <formula>-<version>.<tag>.bottle.tar.gz (the
+          # codename in the tag is the only platform marker) and in agreement
+          # with the formula's bottle block. No `--keep-old` either (it
+          # conflicts with `--no-rebuild`). See AGENTS.md.
+          # Guard against bottling a broken keg. `brew install` above is allowed
+          # to exit non-zero, and `brew bottle` does not re-verify the install:
+          # with the mask still in place it happily produced a bottle from a
+          # half-installed keg, which then failed only at `brew install` time on
+          # a user's machine.
+          for formula in libangle libepoxy-angle virglrenderer qemu-virgl; do
+            if ! brew list --formula "milesbuckton/qemu-virgl/${formula}" >/dev/null 2>&1; then
+              echo "::error::milesbuckton/qemu-virgl/${formula} is not installed; refusing to bottle"
+              exit 1
+            fi
+          done
+
+          brew bottle --json --no-rebuild --root-url "$ROOT_URL" milesbuckton/qemu-virgl/libangle
+          brew bottle --json --no-rebuild --root-url "$ROOT_URL" milesbuckton/qemu-virgl/libepoxy-angle
+          brew bottle --json --no-rebuild --root-url "$ROOT_URL" milesbuckton/qemu-virgl/virglrenderer
+          brew bottle --json --no-rebuild --root-url "$ROOT_URL" milesbuckton/qemu-virgl/qemu-virgl
+
+          # `brew bottle` names archives <formula>--<version>.<tag>.bottle.tar.gz
+          # (double dash), but Homebrew resolves the download URL as
+          # <formula>-<version>.<tag>.bottle.tar.gz (single dash). Rename the
+          # double dash to a single dash so `brew install` can find the archive on
+          # the release. The glob stays *.bottle*.tar.gz rather than the literal
+          # name so the rename keeps working whatever suffix brew emits.
+          for file in ./*.bottle*.tar.gz; do
+            if [ -f "$file" ]; then
+              newname=${file//--/-}
+              if [ "$file" != "$newname" ]; then
+                echo "Renaming: $file -> $newname"
+                mv "$file" "$newname"
+              fi
+            fi
+          done
+
+          mv ./*.bottle*.tar.gz ./*.bottle.json bottles/ 2>/dev/null || true
+
+      - name: Upload bottles as artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: bottles-arm64_golden_gate
+          path: bottles/
+
+  release:
+    needs: publish
+    runs-on: xcode-27
+    # This job writes to Formula/ and force-pushes main, so it needs write.
+    # `publish` and `verify` do not.
+    permissions:
+      contents: write
+    env:
+      # As in the publish job: this one runs `brew bottle --merge --write`,
+      # which must not be perturbed by a background `brew update`.
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_ANALYTICS: 1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download all bottle artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: all-bottles
+          pattern: bottles-*
+          merge-multiple: true
+
+      - name: Create release and upload bottles
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BUILD_STAMP="$(date -u +%Y%m%d.%H%M%S)"
+
+          # Keep at most one release: delete any previous release so re-runs never
+          # accumulate. We deliberately drop --cleanup-tag: the `latest` tag stays
+          # intact at its current commit and the release is re-attached to it.
+          #
+          # WARNING: if the `latest` TAG is missing (user deleted it, first-ever
+          # run), `gh release create` below would create a DRAFT release whose
+          # assets live under .../releases/download/untagged-<sha>/... instead of
+          # .../releases/download/latest/..., which breaks the bottle root_url.
+          # Ensure the tag exists (pointing at origin/main) before creating the
+          # release so it is always created non-draft under the fixed tag.
+          #
+          # Prune every release, not just the most recent one (normally there is
+          # exactly one, `latest`): any surviving release with a different
+          # tagName would make `gh release create latest` below fail with
+          # "already_exists". Only releases carrying bottle assets are pruned —
+          # this job holds `contents: write` and `gh release delete` is not
+          # undoable, so an unrelated hand-made release must not be collateral.
+          # Tags are kept (gh release delete leaves tags alone unless
+          # --cleanup-tag is passed); the tag check below recreates `latest` if
+          # it went missing.
+          for tag in $(gh release list --repo ${{ github.repository }} --limit 100 \
+                       --json tagName --jq '.[].tagName' 2>/dev/null || true); do
+            assets=$(gh release view "$tag" --repo ${{ github.repository }} \
+                       --json assets --jq '[.assets[].name] | map(select(test("\\.bottle\\.tar\\.gz$"))) | length' \
+                       2>/dev/null || echo 0)
+            if [ "$assets" -eq 0 ]; then
+              echo "Keeping release '$tag': it carries no bottle assets"
+              continue
+            fi
+            echo "Pruning previous bottle release (keeping tag): $tag"
+            gh release delete "$tag" --repo ${{ github.repository }} --yes || true
+          done
+
+          if ! git ls-remote --exit-code origin "refs/tags/$RELEASE_TAG" >/dev/null; then
+            echo "Tag $RELEASE_TAG is missing; recreating it at origin/main"
+            git fetch origin main
+            git tag -f "$RELEASE_TAG" origin/main
+            git push --force origin "refs/tags/$RELEASE_TAG"
+          fi
+
+          # Create or update the release in place. `gh release create` alone is
+          # not idempotent: the retry below would otherwise die with
+          # "already_exists" after a partially-completed earlier attempt, and
+          # `--clobber` lets a re-uploaded asset replace a same-named one
+          # instead of colliding.
+          #
+          # Pruning above normally clears the way, but the release is what makes
+          # the bottles downloadable, so make it self-healing rather than
+          # depending on the prune having succeeded.
+          if gh release view "$RELEASE_TAG" --repo ${{ github.repository }} >/dev/null 2>&1; then
+            echo "Release '$RELEASE_TAG' exists; uploading assets in place"
+            gh release upload "$RELEASE_TAG" \
+              --repo ${{ github.repository }} --clobber \
+              all-bottles/*.bottle*.tar.gz
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo ${{ github.repository }} \
+              --title "Bottles $BUILD_STAMP" \
+              --notes "Pre-built bottles for macOS 27 (Apple Silicon), built $BUILD_STAMP" \
+              all-bottles/*.bottle*.tar.gz
+          fi
+
+      - name: Set up tap
+        run: |
+          brew tap milesbuckton/qemu-virgl file://${{ github.workspace }}
+          brew trust milesbuckton/qemu-virgl
+
+      - name: Merge bottle blocks into formulae
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd ${{ github.workspace }}
+          for formula in libangle libepoxy-angle virglrenderer qemu-virgl; do
+            # Collect every bottle JSON produced for this formula and merge them
+            # ALL in a single `brew bottle --merge` call. `brew bottle --merge`
+            # REPLACES the formula's bottle block with the tags from the JSON(s)
+            # given in that invocation; it does not read the block written by a
+            # previous call. Merging one JSON per call would therefore drop
+            # every arch but the last one processed, so if multiple JSONs are
+            # ever present (e.g. a future arch is added) they must be passed
+            # together. Today the workflow only builds arm64_golden_gate, so this
+            # loop normally finds a single JSON per formula.
+            jsons=()
+            for json in all-bottles/*"${formula}"*.bottle.json; do
+              [ -f "$json" ] || continue
+              jsons+=("$json")
+            done
+            if [ ${#jsons[@]} -gt 0 ]; then
+              echo "Merging ${jsons[*]} for $formula"
+              # No --root-url here: in merge mode `brew bottle --merge` takes
+              # root_url from the JSON the publish job wrote (it was given
+              # --root-url there), and ignores the flag. Passing it anyway
+              # suggested it was load-bearing for the formula's root_url.
+              brew bottle --merge --write "${jsons[@]}"
+            fi
+          done
+          # brew bottle --merge --write updates the tap clone under
+          # $(brew --repository)/Library/Taps, so copy the merged formulae back
+          # into the workspace before committing. Ask brew where the tap lives
+          # rather than hardcoding the Taps path.
+          cp "$(brew --repository milesbuckton/qemu-virgl)"/Formula/*.rb Formula/
+
+          # Guard: `rebuild N` in the bottle JSON is copied verbatim into the
+          # formula's bottle block by `brew bottle --merge` (the DSL only
+          # emits the line when the value is positive), so if the publish job
+          # ever ships a numbered bottle again this sed keeps the committed
+          # formula — and therefore the URL Homebrew requests — in agreement
+          # with the plain archive name. With `--no-rebuild` in the publish
+          # job this is now a no-op safety net; the archive name is decided
+          # at build time, not here. See AGENTS.md.
+          sed -i '' -e '/^[[:space:]]*rebuild[[:space:]]*[0-9]/d' Formula/*.rb
+
+      # This step is the one that matters most: the assets went live in the
+      # previous step, and until this lands, `main`'s bottle blocks name stale
+      # checksums for the *same* URLs, so every `brew install` fails a checksum
+      # mismatch. `--force-with-lease` rejecting the push (anything else landed
+      # on main meanwhile) previously left the tap broken until the next run.
+      # So: retry, and always re-check what actually ended up on origin/main.
+      - name: Amend bottle blocks into root commit
+        run: |
+          cd ${{ github.workspace }}
+          git config user.name "${{ github.actor }}"
+          # Match user.name: the hardcoded personal address made the amend
+          # commit show up unverified for anyone who is not that address.
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+
+          git add Formula/
+          if git diff --cached --quiet; then
+            echo "No formula changes to amend"
+          else
+            git commit --amend --no-edit
+          fi
+
+          for attempt in 1 2 3; do
+            if git diff --quiet origin/main Formula/; then
+              echo "Formula/ already matches origin/main; nothing to push"
+              break
+            fi
+            if git push --force-with-lease origin main; then
+              echo "Pushed amended bottle blocks (attempt ${attempt})"
+              break
+            fi
+            echo "::warning::push attempt ${attempt} rejected; rebasing onto the new origin/main"
+            # Something landed on main since checkout. Re-apply the bottle
+            # blocks on top of it rather than clobbering the new commit.
+            git fetch origin main
+            git rebase origin/main || git rebase --abort || true
+            git commit --amend --no-edit
+          done
+
+          # Always re-verify against the remote, whichever path we took: the
+          # whole point is that a silent mismatch here breaks installs.
+          git fetch origin main
+          if ! git diff --quiet origin/main Formula/; then
+            echo "::error::bottle blocks on origin/main do not match this run's bottles;"
+            echo "::error::the published release will fail its checksum on install"
+            git diff origin/main Formula/ || true
+            exit 1
+          fi
+
+          git tag -f latest HEAD
+          git push --force origin latest
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: brew-logs-publish
+          path: |
+            ~/Library/Logs/Homebrew/*.log
+            ~/Library/Logs/Homebrew/*/*.log
+            ~/Library/Caches/Homebrew/Logs/*.log
+
+  verify:
+    # Run the bottle-install + smoke-test path against the bottles that the
+    # `release` job just published. Serializes after `release` so this job
+    # always exercises the bottles from the same workflow run (the `latest`
+    # release is overwritten on every publish, so an out-of-order verify job
+    # could otherwise test stale bottles from a previous run).
+    needs: release
+    runs-on: xcode-27
+    # Read-only: this job only installs and smoke-tests what the release job
+    # published.
+    permissions:
+      contents: read
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+      HOMEBREW_NO_ANALYTICS: 1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # Refresh to the latest commit on main. The `release` job (which this
+      # job depends on) may have pushed the amended bottle blocks between when
+      # the workflow run started and when this job runs, so explicitly fetch +
+      # reset to origin/main before installing. Without this, the formulae would
+      # still match the run's HEAD SHA at workflow start, not the bottle blocks
+      # the release job just committed.
+      #
+      # Use an explicit forced refspec: the default is `refs/heads/main`, and the
+      # release job force-pushes an *amended* commit, which a plain fetch can
+      # reject as non-fast-forward.
+      - name: Refresh to latest main
+        run: git fetch origin +refs/heads/main:refs/remotes/origin/main && git reset --hard origin/main
+
+      - name: Set up tap
+        run: |
+          brew tap milesbuckton/qemu-virgl file://${{ github.workspace }}
+          brew trust milesbuckton/qemu-virgl
+          brew tap-info milesbuckton/qemu-virgl
+
+      # Clear cache so a stale pour doesn't satisfy the install. The
+      # `publish` job already cleared its cache, but `verify` is a fresh
+      # job and may share an image with other workflows; clear defensively.
+      - name: Clear Homebrew cache
+        run: |
+          brew cleanup -s || true
+          rm -rf "$(brew --cache)"
+          rm -rf ~/Library/Caches/Homebrew/*-git
+
+      # Bottle-install path: pours the qemu-virgl bottle just produced by the
+      # `release` job (after the Refresh-to-latest-main step fetches the
+      # bottle-block commit) and smoke-tests the binary. This is the workflow's
+      # end-to-end correctness check.
+      - name: Install from bottles
+        run: |
+          echo "Installing pre-built bottles..."
+          brew install milesbuckton/qemu-virgl/qemu-virgl
+
+      - name: Test QEMU basic functionality
+        run: |
+          QV=$(brew --prefix milesbuckton/qemu-virgl/qemu-virgl)/bin
+          "$QV/qemu-system-aarch64" --version
+          "$QV/qemu-img" --version
+          # Smoke test: run for a few seconds and kill. Background + sleep
+          # instead of `timeout` because GNU timeout may not be installed
+          # on all macOS runners.
+          "$QV/qemu-system-aarch64" -machine virt -accel tcg -nographic -m 512M &
+          QEMU_PID=$!
+          sleep 5
+          kill "$QEMU_PID" 2>/dev/null || true
+          wait "$QEMU_PID" 2>/dev/null || true
+
+      # Same hard-assertion script the publish job runs, so this exercises the
+      # *poured bottles* rather than the freshly-built kegs. It fails the job
+      # when the GPU stack is not wired up.
+      - name: Verify GPU wiring
+        run: ./script/verify-gpu-wiring.sh
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: brew-logs-verify
+          path: |
+            ~/Library/Logs/Homebrew/*.log
+            ~/Library/Logs/Homebrew/*/*.log
+            ~/Library/Caches/Homebrew/Logs/*.log
