@@ -1,0 +1,194 @@
+name: "Homebrew style"
+
+# Lint the formulae with Homebrew's own rubocop cop set (`brew style`), which
+# understands the Formula DSL. The repository contains no Ruby outside
+# Formula/, so a plain-rubocop job (the previous setup) inspected zero files
+# and always passed.
+#
+# Note that publish.yml commits the bottle blocks to main using the default
+# GITHUB_TOKEN, and GitHub deliberately does not fire `push` triggers for
+# GITHUB_TOKEN pushes (anti-recursion) -- so the bottle-block commit (the
+# tip of main) is never styled automatically after a publish run.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  style:
+    runs-on: xcode-27
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v7.0.1
+
+    - name: Set up tap
+      run: |
+        brew tap milesbuckton/qemu-virgl file://${{ github.workspace }}
+        brew trust milesbuckton/qemu-virgl
+        brew tap-info milesbuckton/qemu-virgl
+
+    - name: Run brew style
+      run: brew style milesbuckton/qemu-virgl
+
+    # `brew style` only lints; it does not run the audit rules, so offences like
+    # a redundant `using:` on a `.git` resource URL pass CI unnoticed. This is
+    # where the formula-level conventions get enforced.
+    #
+    # The audit runs through script/audit.sh rather than a bare `brew audit`
+    # loop because of one upstream rule that contradicts this tap's design:
+    # since Homebrew 85ffa721b0 (2026-10-17), `brew audit --strict` demands a
+    # full commit hash in `revision:` for every Git source that is not HEAD,
+    # which is exactly the moving-branch source this tap uses on purpose. The
+    # script tolerates that one message and nothing else. It also checks
+    # whether the Homebrew running the audit has the rule at all: that commit
+    # is on master and in no release tag, so the runner's Homebrew usually
+    # predates it and reports nothing -- a warning, not a failure. Once the
+    # rule is present the message is required again, so the exemption cannot
+    # rot unnoticed. See AGENTS.md, "Sources are branches, not revisions".
+    - name: Run brew audit
+      run: ./script/audit.sh milesbuckton/qemu-virgl
+
+    # The formulae' `test do` blocks deliberately do NOT run here. `brew test`
+    # requires the formula to be installed at its latest version
+    # (dev-cmd/test.rb:44), and this job installs nothing — it only taps and
+    # lints. That is why an earlier version of this step failed with the
+    # misleading "Testing requires the latest version of ..." for a formula
+    # that was not out of date at all, just absent.
+    #
+    # Pouring the published bottles here instead would test the PREVIOUS run's
+    # artifacts, not the pushed commit, and would make linting depend on the
+    # release existing. They run in publish.yml's "Run formula tests" step
+    # instead, against the from-source kegs that are about to be bottled, so a
+    # failing test blocks a bottle rather than a user's `brew install`.
+
+    - name: Check shared Python resources stay in lockstep
+      # setuptools, wheel and packaging are declared identically in
+      # qemu-virgl.rb and virglrenderer.rb (both formulae feed the same
+      # HermeticVenv build backend). The two "update both in lockstep" NOTE
+      # comments document the coupling but cannot enforce it, and a silent
+      # drift only surfaces ~30 minutes into a publish as a pip checksum
+      # mismatch. Assert each shared resource block is byte-identical across
+      # both formulae -- the same "turn a silent no-op into a loud failure"
+      # principle as the `patch!` helper and verify-gpu-wiring.sh.
+      #
+      # The shared set is derived from the formulae rather than listed here, so
+      # a resource that becomes shared later is covered without editing this
+      # workflow. A shared resource must also play the same role in both
+      # formulae ("backend" for the wheels installed into the venv's
+      # wheelhouse, "runtime" for the sdists pip installs from it): a resource
+      # that is a backend in one and a runtime package in the other would let a
+      # bump break one build and not the other.
+      shell: bash
+      run: |
+        set -euo pipefail
+        tap_dir="$(brew --repository milesbuckton/qemu-virgl)"
+        qv="$tap_dir/Formula/qemu-virgl.rb"
+        vr="$tap_dir/Formula/virglrenderer.rb"
+
+        # Print the `resource "<name>" do ... end` block from a formula.
+        extract() {
+          awk -v name="$1" '$0 ~ ("resource \"" name "\" do"){f=1} f{print} f && /^  end/{exit}' "$2"
+        }
+
+        # Print the names of every `resource "<name>"` block in a formula.
+        declared() {
+          sed -n 's/^  resource "\([^"]*\)" do$/\1/p' "$1" | sort -u
+        }
+
+        # Print the names in a hermetic_venv(path, %w[...]) build-backend list.
+        backends() {
+          sed -n 's/.*hermetic_venv(.*%w\[\([^]]*\)\].*/\1/p' "$1" | tr ' ' '\n' | grep -v '^$' | sort -u
+        }
+
+        # Print the names passed to hermetic_pip_install(venv_python, "...").
+        runtimes() {
+          sed -n 's/.*hermetic_pip_install(.*"\([^"]*\)".*/\1/p' "$1" | sort -u
+        }
+
+        # The role a formula gives a resource: "backend", "runtime" or "".
+        role() {
+          if grep -qx "$2" <(backends "$1"); then echo "backend"; fi
+          if grep -qx "$2" <(runtimes "$1"); then echo "runtime"; fi
+        }
+
+        rc=0
+
+        # The resources both formulae declare.
+        shared="$(comm -12 <(declared "$qv") <(declared "$vr") | tr '\n' ' ')"
+        echo "shared resources: ${shared}"
+
+        for res in $shared; do
+          qv_block="$(extract "$res" "$qv")"
+          vr_block="$(extract "$res" "$vr")"
+          if [ -z "$qv_block" ] || [ -z "$vr_block" ]; then
+            echo "::error::resource \"${res}\" must be declared in BOTH qemu-virgl.rb and virglrenderer.rb"
+            rc=1
+          elif [ "$qv_block" != "$vr_block" ]; then
+            echo "::error::resource \"${res}\" differs between qemu-virgl.rb and virglrenderer.rb; update both in lockstep"
+            diff -u <(printf '%s\n' "$qv_block") <(printf '%s\n' "$vr_block") || true
+            rc=1
+          else
+            echo "ok: ${res} in lockstep"
+          fi
+        done
+
+        # A shared resource must be used the same way in both formulae.
+        for res in $shared; do
+          qv_role="$(role "$qv" "$res")"
+          vr_role="$(role "$vr" "$res")"
+          if [ "$qv_role" != "$vr_role" ]; then
+            echo "::error::resource \"${res}\" plays different roles: qemu-virgl.rb=${qv_role:-unused} virglrenderer.rb=${vr_role:-unused}"
+            rc=1
+          fi
+        done
+
+        # Every resource the venv installs must be declared. `--no-index` makes
+        # a missing wheel a build failure, and that failure lands ~30 minutes
+        # into a publish rather than here.
+        for f in "$qv" "$vr"; do
+          for res in $(backends "$f") $(runtimes "$f"); do
+            if ! grep -qx "$res" <(declared "$f"); then
+              echo "::error::$(basename "$f") installs resource \"${res}\" but does not declare it"
+              rc=1
+            fi
+          done
+        done
+
+        # The Python interpreter pin is the same failure class as the shared
+        # resources above: `depends_on "python@3.15"` appears in five
+        # formulae, and HermeticVenv::PYTHON plus the two formula-side
+        # `python3.15` paths must move with it — a drift otherwise surfaces
+        # ~30 minutes into a publish rather than here in seconds.
+        # HermeticVenv::PYTHON is the source of truth; every other site is
+        # checked against it.
+        hv="$tap_dir/lib/hermetic_venv.rb"
+        pin="$(sed -n 's/^  PYTHON = "python@\(.*\)"$/\1/p' "$hv")"
+        if [ -z "$pin" ]; then
+          echo "::error::cannot read HermeticVenv::PYTHON from lib/hermetic_venv.rb"
+          rc=1
+        else
+          echo "python pin (HermeticVenv::PYTHON): python@${pin}"
+          for f in "$tap_dir"/Formula/*.rb; do
+            bad="$(grep -n 'python@3\.' "$f" | grep -v "python@${pin}" || true)"
+            if [ -n "$bad" ]; then
+              echo "::error::$(basename "$f") references a python other than python@${pin}:"
+              echo "$bad"
+              rc=1
+            fi
+          done
+          # The two formula-side interpreter paths hardcode `python3.x` and
+          # must match the pin's versioned binary name.
+          for f in "$tap_dir"/Formula/gn.rb "$tap_dir"/Formula/libangle.rb; do
+            bad="$(grep -n 'python3\.' "$f" | grep -v "python${pin}" || true)"
+            if [ -n "$bad" ]; then
+              echo "::error::$(basename "$f") references a python3.x binary other than python${pin}:"
+              echo "$bad"
+              rc=1
+            fi
+          done
+        fi
+        exit "$rc"
