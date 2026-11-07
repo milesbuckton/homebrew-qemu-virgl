@@ -1,0 +1,16 @@
+.DS_Store
+
+# Bottle artifacts
+*.bottle*.tar.gz
+*.bottle.json
+bottles/
+all-bottles/
+
+# Logs and test outputs
+*.log
+test
+test.dSYM
+
+# Python virtual environment
+venv/
+wheelhouse/
